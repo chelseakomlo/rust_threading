@@ -1,8 +1,19 @@
+extern crate libc;
+
 use std::sync::mpsc;
 use std::thread;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time;
+use libc::c_char;
+use std::ffi::CString;
+use std::ffi::CStr;
+
+// FFI into C functions
+extern "C" {
+    fn say_something(phrase: *const c_char);
+    fn shout_something(phrase: *const c_char);
+}
 
 pub struct Threadpool {
     workers: Vec<Worker>,
@@ -11,6 +22,7 @@ pub struct Threadpool {
 
 pub struct Worker {
     thread: thread::JoinHandle<()>,
+    id: i8,
 }
 
 // Tell Rust explicitely that we can take ownership of the value inside the Box
@@ -26,37 +38,27 @@ impl<F: FnOnce()> FnBox for F {
 type Job = Box<FnBox + Send + 'static>;
 
 impl Worker {
-    fn new(receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let thread = thread::spawn(move || {
-            loop {
-                // can panic if the mutex is in a poisened state- for example, if
-                // another thread panicked while holding the lock
-                let job = receiver.lock().unwrap().recv().unwrap();
-                job.call_box();
-            }
+    fn new(receiver: Arc<Mutex<mpsc::Receiver<Job>>>, id: i8) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let job = receiver.lock().unwrap().recv().unwrap();
+            print!("Worker {} processing cells \n", id);
+            job.call_box();
         });
 
-
-        Worker { thread }
+        Worker { thread, id }
     }
 }
 
 impl Threadpool {
-    // TODO return an Result with a possible error if the size is less than 0
     pub fn new(s: usize) -> Threadpool {
         let mut workers = Vec::with_capacity(s);
 
         let (sender, receiver) = mpsc::channel();
 
-        // Arc allows multiple workers to own the receiver
-        // Mutex ensures that only one worker gets a job from the receiver at
-        // a time.
-        // Overall this allows us to share the receiving end of the channel
-        // with mulitple workers in a way that is mutable by each worker.
         let receiver = Arc::new(Mutex::new(receiver));
 
-        for _ in 0..s {
-            let worker = Worker::new(Arc::clone(&receiver));
+        for id in 0..s {
+            let worker = Worker::new(Arc::clone(&receiver), id as i8);
             workers.push(worker);
         }
 
@@ -67,36 +69,68 @@ impl Threadpool {
     where
         F: FnOnce() + Send + 'static,
     {
-        // create a job type alias that holds the closure
         let job = Box::new(f);
 
-        // send the job down the channel
-        // call unwrap in case sendig the job failed. This can happen in the
-        // case that all threads have been stopped
         self.sender.send(job).unwrap();
     }
 }
 
-fn handle(n: i8) {
-    print!("Hello, world! {} \n", n);
+fn handle(cell_queue: Vec<Cell>) {
+    for cell in cell_queue {
+        execute_task(cell.task, cell.ptr);;
+    }
 }
 
-fn handle_odd(n: i8, m: i8) {
-    print!("Hello, world odd! {} \n", n);
+enum Task {
+    Say,
+    Shout,
+}
+
+fn execute_task(task: Task, ptr: *const c_char) {
+    match task {
+        Task::Say => unsafe { say_something(ptr) },
+        Task::Shout => unsafe { shout_something(ptr) },
+    }
+}
+
+unsafe impl Send for Cell {}
+struct Cell {
+    ptr: *const c_char,
+    task: Task,
 }
 
 fn main() {
-    let pool = Threadpool::new(4);
+    let pool = Threadpool::new(2);
 
-    for n in 1..10 {
-        let number = n;
-        if n % 2 == 0 {
-            pool.execute(move || { handle(number); });
-        } else {
-            pool.execute(move || { handle_odd(number, number); });
-        }
+    let hi_str = CString::new("Hi!").unwrap();
+    let hello_str = CString::new("Hello!").unwrap();
+    let howdy_str = CString::new("Howdy!").unwrap();
+    let yo_str = CString::new("Yo!").unwrap();
+
+    let cell_one = Cell {
+        ptr: hi_str.as_ptr(),
+        task: Task::Say,
+    };
+    let cell_two = Cell {
+        ptr: hello_str.as_ptr(),
+        task: Task::Shout,
+    };
+    let cell_three = Cell {
+        ptr: howdy_str.as_ptr(),
+        task: Task::Shout,
+    };
+    let cell_four = Cell {
+        ptr: yo_str.as_ptr(),
+        task: Task::Say,
+    };
+
+    let a = vec![cell_one];
+    let b = vec![cell_two, cell_three];
+    let c = vec![cell_four];
+
+    let cell_work_queue = vec![a, b, c];
+
+    for n in cell_work_queue {
+        pool.execute(move || { handle(n); });
     }
-
-    // Allow all threads to finish
-    thread::sleep(time::Duration::from_millis(5000));
 }
