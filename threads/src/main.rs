@@ -4,10 +4,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time;
 use libc::c_char;
 use std::ffi::CString;
-use std::ffi::CStr;
 
 // FFI into C functions
 extern "C" {
@@ -17,12 +15,18 @@ extern "C" {
 
 pub struct Threadpool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Message>,
 }
 
 pub struct Worker {
-    thread: thread::JoinHandle<()>,
+    // This should be an option so that we can clean up the thread when shuttind down.
+    thread: Option<thread::JoinHandle<()>>,
     id: i8,
+}
+
+enum Message {
+    NewJob(Job),
+    Terminate,
 }
 
 // Tell Rust explicitely that we can take ownership of the value inside the Box
@@ -38,14 +42,26 @@ impl<F: FnOnce()> FnBox for F {
 type Job = Box<FnBox + Send + 'static>;
 
 impl Worker {
-    fn new(receiver: Arc<Mutex<mpsc::Receiver<Job>>>, id: i8) -> Worker {
+    fn new(receiver: Arc<Mutex<mpsc::Receiver<Message>>>, id: i8) -> Worker {
         let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap();
-            print!("Worker {} processing cells \n", id);
-            job.call_box();
+            let message = receiver.lock().unwrap().recv().unwrap();
+
+            match message {
+                Message::NewJob(job) => {
+                    print!("Worker {} processing cells \n", id);
+                    job.call_box();
+                }
+                Message::Terminate => {
+                    print!("Worker {} terminating \n", id);
+                    break;
+                }
+            }
         });
 
-        Worker { thread, id }
+        Worker {
+            thread: Some(thread),
+            id: id,
+        }
     }
 }
 
@@ -71,7 +87,25 @@ impl Threadpool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+impl Drop for Threadpool {
+    // join each thread when the thread pool goes out of scope
+    fn drop(&mut self) {
+        // send terminate message before joining each thread
+        for _ in &mut self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+            if let Some(thread) = worker.thread.take() {
+                // move the worker's thread from Some to None
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
@@ -130,7 +164,11 @@ fn main() {
 
     let cell_work_queue = vec![a, b, c];
 
+    println!("Processing cells.");
+
     for n in cell_work_queue {
         pool.execute(move || { handle(n); });
     }
+
+    println!("Shutting down.");
 }
